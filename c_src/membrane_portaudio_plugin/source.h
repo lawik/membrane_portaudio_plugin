@@ -11,12 +11,20 @@
 
 #include "pa_helper.h"
 
-typedef struct _SourceState {
-  int is_content_destroyed;
+// Everything the PortAudio callback works on. It lives outside of the resource
+// because the callback keeps running with a pointer to it after the resource
+// has been garbage collected, until the SyncExecutor stops the stream in
+// destroy.
+typedef struct _SourceCtx {
   int channels;
   int frame_size;
   PaStream *stream;
   UnifexPid destination; // Where capture thread will send messages
+} SourceCtx;
+
+typedef struct _SourceState {
+  int is_content_destroyed;
+  SourceCtx *ctx;
 } SourceState;
 
 #include "_generated/source.h"

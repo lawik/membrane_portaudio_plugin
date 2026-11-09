@@ -6,6 +6,9 @@
 
 void handle_destroy_state(UnifexEnv *env, SinkState *state) {
   if (state->is_content_destroyed) return;
+  // The stream is still running and its callback uses state->ctx, so the
+  // context has to stay alive until the SyncExecutor has stopped the stream.
+  // Hand it over in a fresh state, this one is freed as soon as we return.
   SinkState *temp_state = unifex_alloc_state(env);
   memcpy(temp_state, state, sizeof(SinkState));
 
@@ -14,7 +17,11 @@ void handle_destroy_state(UnifexEnv *env, SinkState *state) {
                               &exec_pid) ||
       !send_destroy(env, exec_pid, 0, temp_state)) {
     MEMBRANE_WARN(env, "PortAudio sink: failed to destroy state");
+    // Nobody is going to stop the stream, so the context must not be freed
+    temp_state->is_content_destroyed = 1;
   }
+  // The message holds its own reference to temp_state
+  unifex_release_state(env, temp_state);
 }
 
 static int callback(const void *_input_buffer, void *output_buffer,
@@ -26,31 +33,31 @@ static int callback(const void *_input_buffer, void *output_buffer,
   UNIFEX_UNUSED(_flags);
 
   UnifexEnv *env = unifex_alloc_env(NULL);
-  SinkState *state = (SinkState *)user_data;
+  SinkCtx *ctx = (SinkCtx *)user_data;
 
-  if (++state->ticks % BUFFERS_PER_TICK == 0) {
-    send_membrane_clock_update(env, state->membrane_clock, UNIFEX_SEND_THREADED,
+  if (++ctx->ticks % BUFFERS_PER_TICK == 0) {
+    send_membrane_clock_update(env, ctx->membrane_clock, UNIFEX_SEND_THREADED,
                                BUFFERS_PER_TICK * frames_per_buffer,
-                               state->sample_rate / 1000);
+                               ctx->sample_rate / 1000);
   }
 
   size_t elements_available =
-      membrane_ringbuffer_get_read_available(state->ringbuffer);
+      membrane_ringbuffer_get_read_available(ctx->ringbuffer);
   if (elements_available >= frames_per_buffer) {
     size_t elements_read = membrane_ringbuffer_read(
-        state->ringbuffer, output_buffer, frames_per_buffer);
-    if (state->demand + elements_read > state->ringbuffer->max_elements / 2) {
+        ctx->ringbuffer, output_buffer, frames_per_buffer);
+    if (ctx->demand + elements_read > ctx->ringbuffer->max_elements / 2) {
       if (!send_portaudio_demand(
-              env, state->demand_handler, UNIFEX_SEND_THREADED,
-              (state->demand + elements_read) * state->frame_size)) {
+              env, ctx->demand_handler, UNIFEX_SEND_THREADED,
+              (ctx->demand + elements_read) * ctx->frame_size)) {
         MEMBRANE_THREADED_WARN(env, "PortAudio sink: failed to send demand");
       }
-      state->demand = 0;
+      ctx->demand = 0;
     } else {
-      state->demand += elements_read;
+      ctx->demand += elements_read;
     }
   } else {
-    memset(output_buffer, 0, frames_per_buffer * state->frame_size);
+    memset(output_buffer, 0, frames_per_buffer * ctx->frame_size);
   }
   unifex_free_env(env);
   return paContinue;
@@ -89,19 +96,29 @@ UNIFEX_TERM create(UnifexEnv *env, UnifexPid demand_handler,
 
   state = unifex_alloc_state(env);
   state->is_content_destroyed = 0;
-  state->ringbuffer = ringbuffer;
-  state->demand_handler = demand_handler;
-  state->membrane_clock = membrane_clock;
-  state->stream = NULL;
-  state->demand = 0;
-  state->ticks = 0;
-  state->frame_size = frame_size;
-  state->sample_rate = sample_rate;
+  state->ctx = unifex_alloc(sizeof(SinkCtx));
+  if (!state->ctx) {
+    MEMBRANE_WARN(env, "Error allocating stream context");
+    membrane_ringbuffer_destroy(ringbuffer);
+    state->is_content_destroyed = 1;
+    error = "alloc_error";
+    goto error;
+  }
+
+  SinkCtx *ctx = state->ctx;
+  ctx->ringbuffer = ringbuffer;
+  ctx->demand_handler = demand_handler;
+  ctx->membrane_clock = membrane_clock;
+  ctx->stream = NULL;
+  ctx->demand = 0;
+  ctx->ticks = 0;
+  ctx->frame_size = frame_size;
+  ctx->sample_rate = sample_rate;
 
   double sample_rate_double = sample_rate * 1.0;
 
-  error = init_pa(env, MEMBRANE_LOG_TAG, STREAM_DIRECTION_OUT, &(state->stream),
-                  state, sample_format, &sample_rate_double, &channels, latency,
+  error = init_pa(env, MEMBRANE_LOG_TAG, STREAM_DIRECTION_OUT, &(ctx->stream),
+                  ctx, sample_format, &sample_rate_double, &channels, latency,
                   &latency_ms, pa_buffer_size, device_id, callback);
 
   if (error) {
@@ -122,24 +139,32 @@ error:
 
 UNIFEX_TERM write_data(UnifexEnv *env, UnifexPayload *payload,
                        SinkState *state) {
+  SinkCtx *ctx = state->ctx;
   size_t elements_written = membrane_ringbuffer_write(
-      state->ringbuffer, payload->data, payload->size / state->frame_size);
-  if (elements_written != payload->size / state->frame_size) {
+      ctx->ringbuffer, payload->data, payload->size / ctx->frame_size);
+  if (elements_written != payload->size / ctx->frame_size) {
     MEMBRANE_WARN(env,
                   "Write: written only %d out of %lu bytes into ringbuffer",
-                  elements_written * state->frame_size, payload->size);
+                  elements_written * ctx->frame_size, payload->size);
     return write_data_result_error_overrun(env);
   }
   return write_data_result_ok(env);
 }
 
 UNIFEX_TERM destroy(UnifexEnv *env, SinkState *state) {
-  destroy_pa(env, MEMBRANE_LOG_TAG, state->stream);
-  state->stream = NULL;
+  SinkCtx *ctx = state->ctx;
+  if (ctx) {
+    // Stops the stream first, so the callback no longer uses the context
+    destroy_pa(env, MEMBRANE_LOG_TAG, ctx->stream);
+    ctx->stream = NULL;
 
-  if (state->ringbuffer) {
-    membrane_ringbuffer_destroy(state->ringbuffer);
-    state->ringbuffer = NULL;
+    if (ctx->ringbuffer) {
+      membrane_ringbuffer_destroy(ctx->ringbuffer);
+      ctx->ringbuffer = NULL;
+    }
+
+    unifex_free(ctx);
+    state->ctx = NULL;
   }
 
   state->is_content_destroyed = 1;
