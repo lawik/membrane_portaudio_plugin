@@ -23,3 +23,5 @@ spec destroy(state) :: :ok
 sends {Native, :destroy :: label, state}
 sends {:portaudio_demand :: label, size :: int}
 sends {:membrane_clock_update :: label, {frames :: int, sample_rate_ms :: int}}
+
+dirty :io, create: 9, destroy: 1

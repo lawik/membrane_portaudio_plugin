@@ -20,3 +20,5 @@ spec destroy(state) :: :ok
 
 sends {Native, :destroy :: label, state}
 sends {:portaudio_payload :: label, payload}
+
+dirty :io, create: 7, destroy: 1

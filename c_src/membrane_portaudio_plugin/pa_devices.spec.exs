@@ -13,3 +13,5 @@ type(
 
 type(default_device :: false | :input | :output)
 spec list() :: devices :: [device]
+
+dirty :io, list: 0
